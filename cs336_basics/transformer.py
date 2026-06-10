@@ -2,7 +2,9 @@ import math
 
 import torch
 import torch.nn as nn
-from einops import einsum
+from einops import einsum, rearrange
+
+from cs336_basics.utils import sdpa, softmax
 
 
 class Linear(nn.Module):
@@ -42,6 +44,29 @@ class RMSNorm(nn.Module):
         return (x / rms * self.gain).to(in_dtype)
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        assert d_k % 2 == 0, "d_k must be even for RoPE"
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        freqs = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k)
+        angles = einsum(positions, freqs, "seq, half -> seq half")
+        self.register_buffer("cos", torch.cos(angles), persistent=False)
+        self.register_buffer("sin", torch.sin(angles), persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        if token_positions is None:
+            token_positions = torch.arange(x.shape[-2], device=x.device)
+        cos = self.cos[token_positions]
+        sin = self.sin[token_positions]
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        out = torch.empty_like(x)
+        out[..., 0::2] = x1 * cos - x2 * sin
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out
+
+
 def silu(x):
     return x * torch.sigmoid(x)
 
@@ -58,6 +83,43 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(silu(self.w1(x)) * self.w3(x))
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, theta: float | None = None, max_seq_len: int = 2048):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        d_k = int(d_model / num_heads)
+
+        self.w_k = Linear(d_model, d_model)
+        self.w_q = Linear(d_model, d_model)
+        self.w_v = Linear(d_model, d_model)
+        self.w_o = Linear(d_model, d_model)
+
+        self.rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len) if theta is not None else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(-2)
+
+        # compute matmuls
+        k = rearrange(self.w_k(x), "... t (h d) -> ... h t d", h=self.num_heads)
+        q = rearrange(self.w_q(x), "... t (h d) -> ... h t d", h=self.num_heads)
+        v = rearrange(self.w_v(x), "... t (h d) -> ... h t d", h=self.num_heads)
+
+        if self.rope is not None:
+            k = self.rope(k)
+            q = self.rope(q)
+
+        # construct attention mask
+        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+
+        # do sdpa
+        h = rearrange(sdpa(k, q, v, mask), "... h t d -> ... t (h d)", h=self.num_heads)
+        return self.w_o(h)
 
 
 if __name__ == "__main__":
