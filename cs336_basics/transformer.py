@@ -122,6 +122,37 @@ class MultiHeadAttention(nn.Module):
         return self.w_o(h)
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, theta, max_seq_len=2048):
+        super().__init__()
+        self.attn = MultiHeadAttention(d_model, num_heads, theta=theta, max_seq_len=max_seq_len)
+        self.ffn = SwiGLU(d_model, d_ff=d_ff)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.ln1(x)
+        x += self.attn(h)
+        h = self.ln2(x)
+        return x + self.ffn(h)
+
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, theta):
+        super().__init__()
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        self.layers = nn.Sequential(
+            *[TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len=context_length) for i in range(num_layers)]
+        )
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
+        x = self.token_embeddings(in_indices)
+        x = self.layers(x)
+        return self.lm_head(self.ln_final(x))
+
+
 if __name__ == "__main__":
     rmsnorm = RMSNorm(5)
     x = torch.randn(5)
